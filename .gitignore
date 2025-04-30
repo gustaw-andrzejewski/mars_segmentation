@@ -1,0 +1,10 @@
+# pycache
+__pycache__/
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+# Python virtual environment
+.venv/
+# lightning logs
+lightning_logs/
+# checkpoints
+*.ckpt
