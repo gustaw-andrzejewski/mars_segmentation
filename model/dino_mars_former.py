@@ -1,125 +1,238 @@
-from typing import Optional
+from typing import Literal, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class LightweightMLPDecoder(nn.Module):
-    """Lightweight MLP Decoder inspired by SegFormer.
+# Core utilities
+def create_activation(name: Literal["gelu", "relu", "leaky_relu"]) -> nn.Module:
+    """Creates the specified activation function."""
+    if name == "gelu":
+        return nn.GELU()
+    if name == "relu":
+        return nn.ReLU(inplace=True)
+    if name == "leaky_relu":
+        return nn.LeakyReLU(0.1, inplace=True)
+    raise ValueError(f"Unsupported activation: {name}")
 
-    Projects multi-scale features to a common dimension, upsamples to target resolution,
-    concatenates, and applies final prediction layers.
-    """
+
+class ChannelNorm(nn.Module):
+    """Layer normalization applied to channel dimension in a [B, C, H, W] tensor."""
+
+    def __init__(self, channels: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Rearrange to normalize over channels, then restore original shape
+        x = x.permute(0, 2, 3, 1)  # [B, C, H, W] → [B, H, W, C]
+        x = self.norm(x)
+        return x.permute(0, 3, 1, 2)  # [B, H, W, C] → [B, C, H, W]
+
+
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt-style residual block with LayerScale."""
 
     def __init__(
         self,
-        in_channels_list: list[int],
-        embed_dim: int,
-        num_classes: int,
-        target_scale: Optional[tuple[int, int]] = None,
-    ):
+        dim: int,
+        activation: str = "gelu",
+        expansion_ratio: int = 4,
+        layer_scale_init: float = 1e-6,
+    ) -> None:
         super().__init__()
 
-        self.proj_layers = nn.ModuleList(
+        hidden_dim = dim * expansion_ratio
+
+        # Block components
+        self.depthwise_conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        self.normalization = ChannelNorm(dim)
+        self.pointwise_expand = nn.Conv2d(dim, hidden_dim, kernel_size=1)
+        self.activation = create_activation(activation)
+        self.pointwise_reduce = nn.Conv2d(hidden_dim, dim, kernel_size=1)
+
+        # Learnable scaling factor (starts near zero)
+        self.layer_scale = nn.Parameter(layer_scale_init * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+
+        # Main branch
+        y = self.depthwise_conv(x)
+        y = self.normalization(y)
+        y = self.pointwise_expand(y)
+        y = self.activation(y)
+        y = self.pointwise_reduce(y)
+
+        # Apply scaling and add residual connection
+        y = self.layer_scale.view(1, -1, 1, 1) * y
+        return residual + y
+
+
+class ConvNeXtDecoder(nn.Module):
+    """Decoder using ConvNeXt blocks with residual connections and LayerScale."""
+
+    def __init__(
+        self,
+        input_channels: Sequence[int],
+        embed_dim: int,
+        num_classes: int,
+        output_size: Optional[tuple[int, int]],
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+
+        self.output_size = output_size
+
+        # Feature projection modules (one per input feature map)
+        self.projections = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.Conv2d(in_ch, embed_dim, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(embed_dim),
-                    nn.ReLU(inplace=True),
+                    nn.Conv2d(channels, embed_dim, kernel_size=1, bias=False),
+                    ConvNeXtBlock(embed_dim, activation=activation),
                 )
-                for in_ch in in_channels_list
+                for channels in input_channels
             ]
         )
 
-        self.target_scale = target_scale
-
-        self.fuse_layer = nn.Sequential(
-            nn.Conv2d(embed_dim * len(in_channels_list), embed_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(embed_dim),
-            nn.ReLU(inplace=True),
+        # Feature fusion and prediction head
+        self.fusion_head = nn.Sequential(
+            nn.Conv2d(embed_dim * len(input_channels), embed_dim, kernel_size=1, bias=False),
+            ConvNeXtBlock(embed_dim, activation=activation),
             nn.Dropout(0.1),
             nn.Conv2d(embed_dim, num_classes, kernel_size=1),
         )
 
     def forward(self, features: list[torch.Tensor]) -> torch.Tensor:
-        target_size = self.target_scale if self.target_scale else features[0].shape[2:]
+        target_size = self.output_size or features[0].shape[2:]
 
-        upsampled_features = []
-        for proj_layer, feature_map in zip(self.proj_layers, features):
-            projected_features = proj_layer(feature_map)
-            upsampled = F.interpolate(projected_features, size=target_size, mode="bilinear", align_corners=False)
-            upsampled_features.append(upsampled)
+        # Project and upsample each feature level
+        upsampled_features = [
+            F.interpolate(proj(feat), size=target_size, mode="bilinear", align_corners=False)
+            for proj, feat in zip(self.projections, features)
+        ]
 
-        fused_features = torch.cat(upsampled_features, dim=1)
-        segmentation_logits = self.fuse_layer(fused_features)
+        # Concatenate and process through fusion head
+        concatenated = torch.cat(upsampled_features, dim=1)
+        return self.fusion_head(concatenated)
 
-        return segmentation_logits
 
-
-class DinoMarsFormer(nn.Module):
-    """Segmentation model combining DINOv2 transformer backbone with lightweight decoder.
-
-    Extracts features from selected transformer layers and processes them for
-    Mars terrain segmentation.
-    """
+class MLPDecoder(nn.Module):
+    """SegFormer-style decoder using only MLP/Conv1x1 operations."""
 
     def __init__(
         self,
-        dino_backbone: nn.Module,
-        selected_layers: list[int],
+        input_channels: Sequence[int],
+        embed_dim: int,
+        num_classes: int,
+        output_size: Optional[tuple[int, int]],
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+
+        self.output_size = output_size
+
+        # Simple projection for each input feature
+        self.projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(channels, embed_dim, kernel_size=1, bias=True),
+                    create_activation(activation),
+                )
+                for channels in input_channels
+            ]
+        )
+
+        # Fusion layer and classifier
+        self.fusion_layer = nn.Sequential(
+            nn.Conv2d(embed_dim * len(input_channels), embed_dim, kernel_size=1, bias=True),
+            create_activation(activation),
+        )
+        self.classifier = nn.Conv2d(embed_dim, num_classes, kernel_size=1, bias=True)
+
+    def forward(self, features: list[torch.Tensor]) -> torch.Tensor:
+        target_size = self.output_size or features[0].shape[2:]
+
+        # Project and upsample each feature level
+        upsampled_features = [
+            F.interpolate(proj(feat), size=target_size, mode="bilinear", align_corners=False)
+            for proj, feat in zip(self.projections, features)
+        ]
+
+        # Fuse features and classify
+        fused = self.fusion_layer(torch.cat(upsampled_features, dim=1))
+        return self.classifier(fused)
+
+
+class DinoMarsFormer(nn.Module):
+    """Mars terrain segmentation model combining DINOv2 backbone with a lightweight decoder."""
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        selected_layers: Sequence[int],
         embed_dim: int,
         num_classes: int,
         image_size: int,
+        decoder_type: Literal["convnext", "mlp"] = "convnext",
+        activation: Literal["gelu", "relu", "leaky_relu"] = "gelu",
         freeze_backbone: bool = True,
-    ):
+    ) -> None:
         super().__init__()
 
-        self.backbone = dino_backbone
-
-        # Freeze backbone parameters if specified
+        # Backbone setup
+        self.backbone = backbone
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
-
         self.frozen_backbone = freeze_backbone
 
-        self.selected_layers_indices = [layer_num - 1 for layer_num in selected_layers]
-        self.patch_size = 14
+        # Feature extraction configuration
+        self.selected_indices = [layer - 1 for layer in selected_layers]  # Convert to 0-indexed
+        self.patch_size = 14  # ViT-S/14
+        self.feature_size = image_size // self.patch_size
         self.image_size = image_size
-        self.embed_dim = embed_dim
-        self.num_classes = num_classes
 
-        backbone_embed_dim = self.backbone.embed_dim
-        in_channels = [backbone_embed_dim] * len(selected_layers)
+        # Decoder setup
+        backbone_dim = self.backbone.embed_dim
+        input_channels = [backbone_dim] * len(selected_layers)
+        output_size = (image_size // 4, image_size // 4)
 
-        self.decoder = LightweightMLPDecoder(
-            in_channels_list=in_channels,
-            embed_dim=embed_dim,
-            num_classes=num_classes,
-            target_scale=(image_size // 4, image_size // 4),
-        )
+        # Initialize appropriate decoder
+        if decoder_type == "convnext":
+            self.decoder: nn.Module = ConvNeXtDecoder(
+                input_channels=input_channels,
+                embed_dim=embed_dim,
+                num_classes=num_classes,
+                output_size=output_size,
+                activation=activation,
+            )
+        elif decoder_type == "mlp":
+            self.decoder = MLPDecoder(
+                input_channels=input_channels,
+                embed_dim=embed_dim,
+                num_classes=num_classes,
+                output_size=output_size,
+                activation=activation,
+            )
+        else:
+            raise ValueError(f"Unknown decoder type: {decoder_type}")
 
     def extract_features(self, x: torch.Tensor) -> list[torch.Tensor]:
-        """Extract feature maps from selected transformer layers."""
+        """Extract features from selected transformer layers."""
         batch_size = x.shape[0]
-        feat_height = self.image_size // self.patch_size
-        feat_width = feat_height
+        feature_h = feature_w = self.feature_size
 
-        if self.frozen_backbone:
-            with torch.no_grad():
-                intermediate_features = self.backbone.get_intermediate_layers(
-                    x, n=max(self.selected_layers_indices) + 1
-                )
-        else:
-            intermediate_features = self.backbone.get_intermediate_layers(
-                x, n=max(self.selected_layers_indices) + 1
-            )
+        # Extract intermediate features with appropriate gradient context
+        grad_context = torch.no_grad if self.frozen_backbone else torch.enable_grad
+        with grad_context():
+            intermediates = self.backbone.get_intermediate_layers(x, n=max(self.selected_indices) + 1)
 
-        selected_features = [intermediate_features[i] for i in self.selected_layers_indices]
-
+        # Select and reshape features to spatial format
+        selected_features = [intermediates[idx] for idx in self.selected_indices]
         feature_maps = [
-            tokens.permute(0, 2, 1).reshape(batch_size, tokens.shape[-1], feat_height, feat_width)
+            tokens.permute(0, 2, 1).reshape(batch_size, tokens.shape[-1], feature_h, feature_w)
             for tokens in selected_features
         ]
 
@@ -127,30 +240,18 @@ class DinoMarsFormer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Process input through backbone and decoder to generate segmentation output."""
-        feature_maps = self.extract_features(x)
-        segmentation_output = self.decoder(feature_maps)
-        return segmentation_output
+        features = self.extract_features(x)
+        return self.decoder(features)
 
-    def count_parameters(self) -> dict[str, int]:
-        """Count and display trainable vs frozen parameters."""
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+    def count_parameters(self) -> None:
+        """Print parameter statistics for the model."""
         total_params = sum(p.numel() for p in self.parameters())
-        backbone_params = sum(p.numel() for p in self.backbone.parameters())
-        decoder_params = sum(p.numel() for p in self.decoder.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
 
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
-        print(f"Frozen parameters: {total_params - trainable_params:,}")
-        print(f"Backbone parameters: {backbone_params:,} ({'frozen' if self.frozen_backbone else 'trainable'})")
-        print(f"Decoder parameters: {decoder_params:,} (trainable)")
-
-        return {
-            "total": total_params,
-            "trainable": trainable_params,
-            "frozen": total_params - trainable_params,
-            "backbone": backbone_params,
-            "decoder": decoder_params,
-        }
+        print(f"Total parameters: {total_params:,} ({total_params/1e6:.1f}M)")  # noqa
+        print(f"Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.1f}M)")  # noqa
+        print(f"Frozen parameters: {frozen_params:,} ({frozen_params/1e6:.1f}M)")  # noqa
 
 
 if __name__ == "__main__":
@@ -158,11 +259,12 @@ if __name__ == "__main__":
     dino_backbone = torch.hub.load("facebookresearch/dinov2", backbone_name)
 
     model = DinoMarsFormer(
-        dino_backbone=dino_backbone,
+        backbone=dino_backbone,
         selected_layers=[3, 6, 9, 11],
         embed_dim=256,
         num_classes=4,
         image_size=224,
+        decoder_type="convnext",
         freeze_backbone=True,
     )
 
