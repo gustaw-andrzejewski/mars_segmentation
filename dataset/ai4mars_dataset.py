@@ -5,8 +5,8 @@ import torch
 from datasets import Dataset as HFDataset
 from torch.utils.data import Dataset
 
-CLASS_LABELS = {0: "Soil", 1: "Bedrock", 2: "Sand", 3: "Big Rock", 255: "Null"}
-IGNORE_INDEX = 4
+TERRAIN_CLASSES = {0: "Soil", 1: "Bedrock", 2: "Sand", 3: "Big Rock"}
+IGNORE_INDEX = 255
 
 
 class AI4MarsDataset(Dataset):
@@ -32,6 +32,5 @@ class AI4MarsDataset(Dataset):
 
         if self.ignore_null:
             mask = mask.long()
-            mask[mask == 255] = IGNORE_INDEX
 
         return {"image": img, "mask": mask}

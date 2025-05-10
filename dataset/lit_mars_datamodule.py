@@ -7,8 +7,8 @@ from PIL import Image as PILImage
 from PIL import UnidentifiedImageError
 from torch.utils.data import DataLoader
 
-from .ai4mars_dataset import AI4MarsDataset
-from .augmentation import build_transforms
+from dataset.ai4mars_dataset import AI4MarsDataset
+from dataset.augmentation import build_transforms
 
 
 def batch_validate_images(batch: list[dict]) -> list[bool]:

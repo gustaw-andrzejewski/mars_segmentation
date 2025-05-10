@@ -6,14 +6,10 @@ from torchmetrics.classification import MulticlassAccuracy
 from torchmetrics.segmentation import DiceScore, GeneralizedDiceScore, MeanIoU
 from typing import Dict, Tuple, Any
 
-# Class labels for Mars terrain segmentation
-TERRAIN_CLASSES = {
-    0: "Soil",
-    1: "Bedrock",
-    2: "Sand",
-    3: "Big Rock",
-    4: "Null",
-}
+from dataset.ai4mars_dataset import IGNORE_INDEX
+from model.dino_mars_former import DinoMarsFormer
+
+TERRAIN_CLASSES = {0: "Soil", 1: "Bedrock", 2: "Sand", 3: "Big Rock"}
 
 
 class LitDinoMarsFormer(L.LightningModule):
@@ -21,9 +17,9 @@ class LitDinoMarsFormer(L.LightningModule):
 
     def __init__(
         self,
-        model: nn.Module,
+        model: DinoMarsFormer,
         num_classes: int,
-        ignore_index: int = 4,
+        ignore_index: int = IGNORE_INDEX,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-4,
     ) -> None:
