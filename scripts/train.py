@@ -10,10 +10,10 @@ from model import DinoMarsFormer, LitDinoMarsFormer
 
 
 def main(
-    batch_size: int = 64,
+    batch_size: int = 128,
     image_size: int = 224,
     validation_split: float = 0.1,
-    learning_rate: float = 1e-3,
+    learning_rate: float = 1e-4,
     weight_decay: float = 1e-3,
     num_epochs: int = 200,
     decoder_type: Literal["convnext", "mlp"] = "convnext",
@@ -54,14 +54,14 @@ def main(
     )
 
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_generalized_dice",
+        monitor="val_iou",
         mode="max",
         save_top_k=1,
         dirpath=save_dir,
         filename="best-checkpoint",
     )
     early_stopping_callback = EarlyStopping(
-        monitor="val_generalized_dice",
+        monitor="val_iou",
         mode="max",
         patience=patience,
         verbose=True,
